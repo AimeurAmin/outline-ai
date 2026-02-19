@@ -15,6 +15,9 @@ logs
 _.log
 report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
+# local index (optional; regenerate with outline-ai index-docs)
+vector-store.json
+
 # dotenv environment variable files
 .env
 .env.development.local

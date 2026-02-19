@@ -1,154 +1,79 @@
-import Anthropic from '@anthropic-ai/sdk';
-import { searchOutlineDocs, type SEARCH_DOCS_LIST } from './outline';
+import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
-import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
-
-type OutlineDocumentInfo = {
-  id?: string;
-  title?: string;
-  name?: string;
-  text?: string;
-  url?: string;
-};
-
-async function getFullDocument(docId: string): Promise<OutlineDocumentInfo | undefined> {
-  const response = await fetch('https://notes.aimamin.com/api/documents.info', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${Bun.env.OUTLINE_API_KEY}`
-    },
-    body: JSON.stringify({ id: docId })
-  });
-  const body = await response.json() as { data?: OutlineDocumentInfo };
-  return body.data;
-}
-
-const QuerySchema = z.object({
-  keywords: z.array(z.string().max(6))
-});
+import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
+import { getAnthropicApiKey } from "./config";
+import { generateEmbedding } from "./embeddings";
+import { vectorStore } from "./vector-store";
+import type { AskResult } from "./types";
 
 const AnswerSchema = z.object({
   answer: z.string(),
-  sources: z.array(z.object({
-    title: z.string(),
-    url: z.string().optional(),
-  }))
+  sources: z.array(
+    z.object({
+      title: z.string(),
+      url: z.string().optional(),
+    })
+  ),
 });
 
-const ask = async (userQuestion: string) => {
-  const client = new Anthropic({
-    apiKey: Bun.env.ANTHROPIC_API_KEY,  
-  });
+export type AskOptions = {
+  vectorStorePath?: string;
+  anthropicApiKey?: string;
+};
 
-  const usedKeywords: string[] = [];
-  let i = 0;
-  let docs: SEARCH_DOCS_LIST = [];
-  
-  // Try up to 5 times to find relevant docs
-  while (i < 5 && docs.length === 0) {
-    i++;
-    
-    console.log(`🔍 Attempt ${i}: Generating search query...`);
-    
-    const queryResponse = await client.messages.create({
-      max_tokens: 100,
-      model: 'claude-sonnet-4-5-20250929',
-      output_config: { format: zodOutputFormat(QuerySchema) },
-      messages: [{ 
-        role: 'user', 
-        content: `Generate 1-6 search keywords for this question: "${userQuestion}"
-
-Requirements:
-- Max 30 characters per keyword
-- No filler words (no "with", "and", "for", "the")
-- Only relevant search terms
-- Don't use these (they didn't work): ${usedKeywords.join(', ')}
-
-Examples:
-Question: "How do we handle authentication?"
-Keywords: ["auth", "login", "jwt"]
-
-Question: "What React performance issues did we find?"
-Keywords: ["react performance", "optimization"]`
-      }],
-    });
-
-    const result = JSON.parse((queryResponse.content[0] as any).text);
-    const keywords = result.keywords;
-    
-    console.log(`Generated keywords:`, keywords);
-    
-    // Try each keyword
-    for (const keyword of keywords) {
-      usedKeywords.push(keyword);
-      docs = await searchOutlineDocs(keyword);
-      
-      if (docs.length > 0) {
-        console.log(`✓ Found ${docs.length} docs with "${keyword}"`);
-        break;
-      }
+export async function ask(userQuestion: string, options?: AskOptions): Promise<AskResult> {
+  const storePath = options?.vectorStorePath ?? "./vector-store.json";
+  if (vectorStore.size === 0) {
+    const loaded = await vectorStore.load(storePath);
+    if (!loaded) {
+      throw new Error(`Vector store not found at ${storePath}. Run indexing first (e.g. outline-ai index-docs).`);
     }
   }
 
-  if (docs.length === 0) {
-    return {
-      answer: "I couldn't find any relevant documents in your Outline for that question.",
-      sources: []
-    };
+  const apiKey = options?.anthropicApiKey ?? getAnthropicApiKey();
+  if (!apiKey) {
+    throw new Error("ANTHROPIC_API_KEY is not set.");
   }
 
-  console.log(`📄 Found ${docs.length} relevant documents`);
+  const client = new Anthropic({ apiKey });
 
-  // Fetch full content for each document (docs are SEARCH_DOC_ITEM[] with .document.id)
-  console.log('📥 Fetching full document content...');
-  const fullDocsRaw = await Promise.all(
-    docs.slice(0, 5).map(doc => getFullDocument(doc.document.id))
-  );
-  const fullDocs = fullDocsRaw.filter((d: OutlineDocumentInfo | undefined): d is OutlineDocumentInfo => d != null);
+  const questionEmbedding = await generateEmbedding(userQuestion);
+  const results = vectorStore.search(questionEmbedding, 5);
 
-  if (fullDocs.length === 0) {
-    return {
-      answer: "I couldn't load the document content from Outline.",
-      sources: []
-    };
+  if (results.length === 0) {
+    return { answer: "I couldn't find any relevant documents.", sources: [] };
   }
 
-  // Build context from docs (Outline may return title or name; text may be in .text)
-  const context = fullDocs.map((doc, i) => ({
+  const context = results.map((doc, i) => ({
     index: i + 1,
-    title: doc.title ?? doc.name ?? 'Untitled',
-    text: (doc.text ?? '').slice(0, 2000),
-    url: doc.url ?? ''
+    title: doc.metadata.title,
+    text: doc.metadata.text.slice(0, 2000),
+    url: doc.metadata.url,
   }));
 
-  // Get answer with structured output
-  console.log('🤖 Asking Claude...');
-  
   const answerResponse = await client.messages.create({
     max_tokens: 2048,
-    model: 'claude-sonnet-4-5-20250929',
+    model: "claude-sonnet-4-5-20250929",
     output_config: { format: zodOutputFormat(AnswerSchema) },
-    messages: [{ 
-      role: 'user', 
-      content: `Based on these documents from Outline, answer the question.
+    messages: [
+      {
+        role: "user",
+        content: `Based on these documents from my Outline, answer the question.
 
 DOCUMENTS:
-${context.map(doc => `[${doc.index}] ${doc.title}\n${doc.text}`).join('\n\n---\n\n')}
+${context.map((doc) => `[${doc.index}] ${doc.title}\n${doc.text}`).join("\n\n---\n\n")}
 
 QUESTION: ${userQuestion}
 
 Instructions:
 - Answer based ONLY on the documents above
 - Cite which documents you're using (e.g., "According to document [1]...")
-- Be specific and factual
-- If the documents don't have enough info, say so`
-    }],
+- Be specific and factual`,
+      },
+    ],
   });
 
-  const answer = JSON.parse((answerResponse.content[0] as any).text);
-  
-  return answer;
+  const raw = (answerResponse.content[0] as { text?: string })?.text;
+  if (!raw) throw new Error("Empty response from Claude");
+  return JSON.parse(raw) as AskResult;
 }
-
-export default ask;
