@@ -1,6 +1,6 @@
 {
   "name": "outline-ai",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Q&A over your Outline wiki using embeddings and Claude",
   "type": "module",
   "main": "dist/index.js",
